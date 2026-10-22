@@ -260,6 +260,46 @@ jobs:
           echo 'Compiler include flags:'
           grep -o -- '-I\$K/freebsd-src/sys' NullMoth/gpu-port/xkpi/cc.sh NullMoth/gpu-port/xkpi/cc-i915.sh
 
+      - name: Namespace LinuxKPI UUID helpers after XNU headers
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3.14 - <<'PY'
+          from pathlib import Path
+
+          xkpi = Path('NullMoth/gpu-port/xkpi')
+          include = xkpi / 'bsdcompat/include'
+          shim = include / 'nmxkpi_linux_uuid_namespace.h'
+          # The native macOS UUID functions have already been declared by
+          # nmxkpi_prelude.h (which includes the Apple kernel headers).
+          # FreeBSD LinuxKPI supplies *different* uuid_copy/uuid_is_null/
+          # uuid_parse signatures. Give the Linux-side inline helpers their
+          # own names, including their callers, without editing Apple SDKs.
+          shim.write_text('''/* LinuxKPI UUID helpers must not collide with Apple's UUID API. */
+          #ifndef NMXKPI_LINUX_UUID_NAMESPACE_H
+          #define NMXKPI_LINUX_UUID_NAMESPACE_H
+          #define uuid_copy nmx_linuxkpi_uuid_copy
+          #define uuid_is_null nmx_linuxkpi_uuid_is_null
+          #define uuid_parse nmx_linuxkpi_uuid_parse
+          #endif
+          ''' )
+
+          for script_name in ('cc.sh', 'cc-i915.sh'):
+              script = xkpi / script_name
+              body = script.read_text()
+              anchor = '-include $X/bsdcompat/include/nmxkpi_prelude.h'
+              inject = '-include $X/bsdcompat/include/nmxkpi_linux_uuid_namespace.h'
+              if inject not in body:
+                  if body.count(anchor) != 1:
+                      raise SystemExit(f'Cannot locate forced-prelude include in {script}')
+                  body = body.replace(anchor, anchor + ' ' + chr(92) + chr(10) + '  ' + inject, 1)
+                  script.write_text(body)
+              print(f'{script}: LinuxKPI UUID functions namespaced after XNU prelude')
+          PY
+          bash -n NullMoth/gpu-port/xkpi/cc.sh
+          bash -n NullMoth/gpu-port/xkpi/cc-i915.sh
+          grep -n 'nmxkpi_linux_uuid_namespace.h' NullMoth/gpu-port/xkpi/cc.sh NullMoth/gpu-port/xkpi/cc-i915.sh
+
       - name: Preflight shared DRM include tree
         shell: bash
         run: |
@@ -273,6 +313,8 @@ jobs:
               -I"$kf" -I"$GITHUB_WORKSPACE/freebsd-src/sys" - \
               > "$GITHUB_WORKSPACE/ci-logs/kernel-header-preflight.i"
           echo 'FreeBSD LinuxKPI compiler_attributes.h: resolvable'
+          echo 'LinuxKPI UUID namespace shim:'
+          cat bsdcompat/include/nmxkpi_linux_uuid_namespace.h
 
           # Probe exactly one real kernel source with both the forced LinuxKPI
           # headers and the rest of the upstream compiler command.
@@ -434,4 +476,3 @@ jobs:
           path: ci-artifacts/
           if-no-files-found: warn
           retention-days: 14
-
