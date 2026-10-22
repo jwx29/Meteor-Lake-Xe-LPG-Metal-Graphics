@@ -3,14 +3,14 @@
 # Sources are exactly what drm-kmod's Makefiles build for amdgpu (minus the display core), drm, ttm and dmabuf,
 # evaluated against amd.flags, minus files that are GPL-only or built on FreeBSD file descriptors or its console;
 # the port supplies its own code for those.
-X=/Volumes/MiniData/build/gpu-src/xkpi
-K=/Volumes/MiniData/build/gpu-src/kpi
+X="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+K="$(cd "$X/../../.." && pwd)"
 cd "$X" || exit 1
 mkdir -p logs && rm -f logs/*.log logs/*.failed
 
 # amdgpu_dm_crc.c: CRC capture is a debugfs feature (no debugfs on macOS; its header stubs the hooks to NULL)
 EXCLUDE="amdgpu_dm_crc.c drm_gem_ttm_helper.c drm_writeback.c drm_hdcp_helper.c sync_file.c dma-fence-unwrap.c dma-buf.c dma-buf-kmod.c linux_fb.c vt_drmfb.c drm_os_freebsd.c"
-/opt/homebrew/bin/python3 srclist.py "$K/drm-kmod" amd.flags amd/amdgpu drm ttm dmabuf 2>/dev/null > srcs.all
+python3 srclist.py "$K/drm-kmod" amd.flags amd/amdgpu drm ttm dmabuf 2>/dev/null > srcs.all
 : > srcs.txt
 while read -r f; do
     case " $EXCLUDE " in

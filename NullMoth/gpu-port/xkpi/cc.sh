@@ -1,8 +1,8 @@
 #!/bin/bash
 # cc.sh <source.c> [extra flags]: compiles one drm-kmod source for the macOS kernel (x86_64) through the
 # FreeBSD-on-xnu layer (bsdcompat) and FreeBSD LinuxKPI. drm-kmod's GPL-only linuxkpi/gplv2 headers are NOT on the path.
-X=/Users/ved/igpu-build/xkpi
-K=/Users/ved/igpu-build/kpi
+X="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+K="$(cd "$X/../../.." && pwd)"
 L=$K/freebsd-src/sys/compat/linuxkpi
 D=$K/drm-kmod
 A=$D/drivers/gpu/drm/amd
