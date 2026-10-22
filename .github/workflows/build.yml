@@ -479,13 +479,74 @@ jobs:
           echo "linker=$linker" >> "$GITHUB_OUTPUT"
           echo "Selected kernel linker: $linker"
 
-      - name: Link NMXGPU
+      - name: Link NMXGPU and validate Mach-O output
         shell: bash
         env:
           KERNEL_LINKER: ${{ steps.kernel.outputs.linker }}
         run: |
           set -euo pipefail
+          # The upstream 1.0.15 script links its new binary first, then
+          # unconditionally uses nm on a developer-specific 1.0.8 baseline.
+          # GitHub Actions does not include that baseline. Keep the ABI
+          # comparison when it is available, but do not fail a valid link
+          # simply because the optional regression fixture is absent.
+          python3.14 - "$KERNEL_LINKER" <<'PY'
+          from pathlib import Path
+          import sys
+          import textwrap
+
+          script = Path(sys.argv[1])
+          source = script.read_text()
+          marker = "a=undefined(r/'desktop-build/NMXGPU-1.0.8')"
+          matches = [i for i, line in enumerate(source.splitlines(keepends=True)) if marker in line]
+          if not matches:
+              if script.name == 'link-kernel-1.0.15.py':
+                  raise SystemExit('Upstream NMXGPU 1.0.15 ABI check changed; review linker before patching')
+              print(f'No known 1.0.8 ABI fixture check in {script}; leaving linker unchanged')
+          elif len(matches) != 1:
+              raise SystemExit('Ambiguous NMXGPU 1.0.8 ABI checks; refusing automatic edit')
+          else:
+              lines = source.splitlines(keepends=True)
+              index = matches[0]
+              line = lines[index]
+              indent = line[:len(line) - len(line.lstrip())]
+              if 'assert b-a <=' not in line or 'undefined(out)' not in line:
+                  raise SystemExit('Unexpected upstream linker ABI check: ' + line.strip())
+              replacement = textwrap.dedent('''\
+              baseline = r / 'desktop-build/NMXGPU-1.0.8'
+              b = undefined(out)
+              if baseline.is_file():
+                  a = undefined(baseline)
+                  print('New imports:', sorted(b - a))
+                  print('Removed imports:', sorted(a - b))
+                  assert b - a <= {'__ZN9IOService11getPlatformEv'}, b - a
+              else:
+                  print('ABI regression comparison skipped: missing', baseline)
+                  print('Newly linked undefined imports:', len(b))
+              ''')
+              lines[index] = ''.join(indent + text + '\n' for text in replacement.rstrip('\n').split('\n'))
+              patched = ''.join(lines)
+              compile(patched, str(script), 'exec')
+              script.write_text(patched)
+              print(f'Guarded optional ABI baseline comparison in {script}')
+          PY
+
           python3.14 "$KERNEL_LINKER" 2>&1 | tee ci-logs/kernel-link.log
+
+          version="${KERNEL_LINKER##*/link-kernel-}"
+          version="${version%.py}"
+          binary="desktop-build/NMXGPU-$version"
+          test -s "$binary" || { echo "Kernel link did not produce $binary" >&2; exit 1; }
+          file "$binary" | tee ci-logs/kernel-binary-type.txt
+          file "$binary" | grep -q 'Mach-O 64-bit.*x86_64.*kext bundle' || {
+            echo "Unexpected NMXGPU binary format: $binary" >&2
+            exit 1
+          }
+          # macOS kernel bundles legitimately have undefined imports that
+          # the operating system resolves. Record them; do not demand zero.
+          xcrun nm -uj "$binary" > ci-logs/kernel-undefined-imports.txt
+          echo "NMXGPU kernel binary: $binary"
+          echo "Undefined kernel imports: $(wc -l < ci-logs/kernel-undefined-imports.txt | tr -d ' ')"
 
       - name: Build framebuffer and panel claim kexts
         shell: bash
