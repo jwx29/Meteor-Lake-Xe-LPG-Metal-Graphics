@@ -217,6 +217,19 @@ jobs:
               updated = original
               for old, new in mappings:
                   updated = updated.replace(old, new)
+              # compiler_types.h includes <compat/linuxkpi/common/include/...>.
+              # -I$L/common/include cannot resolve that prefixed path; the
+              # correct include root is freebsd-src/sys. Keep it *after*
+              # Kernel.framework so native macOS headers retain priority.
+              if path.name in ('cc.sh', 'cc-i915.sh'):
+                  flag = '-I$K/freebsd-src/sys'
+                  if flag not in updated:
+                      # Both compiler entrypoints put -I$KF immediately before
+                      # "$@"; anchor here rather than modifying other -I order.
+                      anchor = '-I$KF "$@"'
+                      if anchor not in updated:
+                          raise SystemExit(f'Unexpected compiler command in {path}: missing {anchor!r}')
+                      updated = updated.replace(anchor, f'-I$KF {flag} "$@"', 1)
               # Include compiler-argument paths embedded in flags too.
               if updated != original:
                   path.write_text(updated)
@@ -229,6 +242,7 @@ jobs:
                       raise SystemExit(f'Unresolved developer path {old} in {path}')
           mandatory = [xkpi / 'bsdcompat/include/nmxkpi_prelude.h',
                        root / 'freebsd-src/sys/compat/linuxkpi/common/include/linux/compiler_types.h',
+                       root / 'freebsd-src/sys/compat/linuxkpi/common/include/linux/compiler_attributes.h',
                        root / 'drm-kmod/drivers/gpu/drm/drm_client.c',
                        root / 'drm-kmod/drivers/gpu/drm/drm_client_modeset.c',
                        root / 'drm-kmod/drivers/gpu/drm/drm_panel_orientation_quirks.c',
@@ -243,6 +257,35 @@ jobs:
           for script in all.sh all-i915.sh cc.sh cc-i915.sh one.sh; do
             bash -n "NullMoth/gpu-port/xkpi/$script"
           done
+          echo 'Compiler include flags:'
+          grep -o -- '-I\$K/freebsd-src/sys' NullMoth/gpu-port/xkpi/cc.sh NullMoth/gpu-port/xkpi/cc-i915.sh
+
+      - name: Preflight shared DRM include tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd NullMoth/gpu-port/xkpi
+          # A small header-only check catches shared include-tree problems
+          # before launching upstream's 900-source parallel compile.
+          kf="$(xcrun --sdk macosx --show-sdk-path)/System/Library/Frameworks/Kernel.framework/Headers"
+          printf '#include <compat/linuxkpi/common/include/linux/compiler_attributes.h>\n' | \
+            xcrun clang -arch x86_64 -x c -E -nostdinc \
+              -I"$kf" -I"$GITHUB_WORKSPACE/freebsd-src/sys" - \
+              > "$GITHUB_WORKSPACE/ci-logs/kernel-header-preflight.i"
+          echo 'FreeBSD LinuxKPI compiler_attributes.h: resolvable'
+
+          # Probe exactly one real kernel source with both the forced LinuxKPI
+          # headers and the rest of the upstream compiler command.
+          src="$GITHUB_WORKSPACE/drm-kmod/drivers/gpu/drm/drm_client.c"
+          echo "Probing $src"
+          if ! bash ./cc.sh "$src" > "$GITHUB_WORKSPACE/ci-logs/kernel-drm-probe.log" 2>&1; then
+            echo 'DRM compiler probe failed. First errors:' >&2
+            grep -m 20 -E 'fatal error:|error:' "$GITHUB_WORKSPACE/ci-logs/kernel-drm-probe.log" >&2 || \
+              tail -n 80 "$GITHUB_WORKSPACE/ci-logs/kernel-drm-probe.log" >&2
+            exit 1
+          fi
+          test -s obj/drm_client.o
+          echo 'DRM compiler probe succeeded.'
 
       - name: Compile DRM core, TTM and dma-buf
         shell: bash
