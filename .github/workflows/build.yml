@@ -537,11 +537,18 @@ jobs:
           version="${version%.py}"
           binary="desktop-build/NMXGPU-$version"
           test -s "$binary" || { echo "Kernel link did not produce $binary" >&2; exit 1; }
-          file "$binary" | tee ci-logs/kernel-binary-type.txt
-          file "$binary" | grep -q 'Mach-O 64-bit.*x86_64.*kext bundle' || {
-            echo "Unexpected NMXGPU binary format: $binary" >&2
+          # Apple's file(1) reports kernel bundles as:
+          #   Mach-O 64-bit kext bundle x86_64
+          # The previous check expected x86_64 before "kext bundle" and
+          # incorrectly rejected a successfully linked NMXGPU binary.
+          binary_type="$(file -b "$binary")"
+          printf '%s\n' "$binary_type" | tee ci-logs/kernel-binary-type.txt
+          if [[ "$binary_type" != *"Mach-O 64-bit"* ||
+                "$binary_type" != *"kext bundle"* ||
+                "$binary_type" != *"x86_64"* ]]; then
+            echo "Unexpected NMXGPU binary format: $binary_type ($binary)" >&2
             exit 1
-          }
+          fi
           # macOS kernel bundles legitimately have undefined imports that
           # the operating system resolves. Record them; do not demand zero.
           xcrun nm -uj "$binary" > ci-logs/kernel-undefined-imports.txt
