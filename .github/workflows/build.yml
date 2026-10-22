@@ -183,7 +183,7 @@ jobs:
           test -f "$script" || { echo "Missing documented plugin builder: $script" >&2; exit 1; }
           python3.14 "$script" 2>&1 | tee ci-logs/plugin.log
 
-      - name: Make upstream kernel compiler paths portable
+      - name: Make upstream kernel paths portable and filter Intel DRM
         shell: bash
         run: |
           set -euo pipefail
@@ -253,6 +253,54 @@ jobs:
               raise SystemExit('Missing compiler sources:\n' + '\n'.join(absent))
           for directory in ('obj','obj-i915','logs','logs-i915','lkobj','srcobj','xnuobj'):
               (xkpi / directory).mkdir(exist_ok=True)
+          PY
+          # The upstream all.sh enumerates AMDGPU plus DRM/TTM; NMXGPU's
+          # frozen 438-object link must not include AMDGPU objects.
+          python3.14 - <<'PY'
+          from pathlib import Path
+          import textwrap
+          xkpi = Path('NullMoth/gpu-port/xkpi')
+          helper = xkpi / 'filter_intel_drm_sources.py'
+          helper.write_text(textwrap.dedent('''\
+          #!/usr/bin/env python3
+          from pathlib import Path
+          from collections import Counter
+          import sys
+
+          srcfile = Path(sys.argv[1])
+          sources = [s for s in srcfile.read_text().splitlines() if s.strip()]
+          def category(s):
+              stem = Path(s).stem
+              if stem.startswith('drm_'): return 'drm'
+              if stem.startswith('ttm_'): return 'ttm'
+              if stem in ('dma-fence', 'dma-fence-array', 'dma-fence-chain', 'dma-resv'): return 'dma'
+              if stem.startswith('sched_'): return 'sched'
+              return None
+
+          wanted = [s for s in sources if category(s)]
+          excluded = [s for s in sources if not category(s)]
+          got = dict(Counter(category(s) for s in wanted))
+          expected = {'drm': 69, 'ttm': 11, 'dma': 4, 'sched': 3}
+          if got != expected:
+              raise SystemExit(f'DRM source manifest changed: {got}, expected {expected}; review upstream changes')
+          if len({Path(s).stem for s in wanted}) != len(wanted):
+              raise SystemExit('Selected DRM files have duplicate object basenames')
+          if any(not Path(s).is_file() for s in wanted):
+              raise SystemExit('Selected DRM source files missing')
+          Path('srcs-excluded-amd.txt').write_text('\\n'.join(excluded) + '\\n')
+          srcfile.write_text('\\n'.join(wanted) + '\\n')
+          print(f'Intel NMXGPU DRM manifest: {len(wanted)} sources; {len(excluded)} unrelated sources excluded')
+          '''))
+          compiler = xkpi / 'all.sh'
+          code = compiler.read_text()
+          needle = "n=$(wc -l < srcs.txt | tr -d ' ')"
+          instruction = 'python3 "$X/filter_intel_drm_sources.py" srcs.txt || exit 1'
+          if instruction not in code:
+              if code.count(needle) != 1:
+                  raise SystemExit('Upstream all.sh source-list boundary changed; cannot inject filter')
+              code = code.replace(needle, instruction + '\n' + needle, 1)
+              compiler.write_text(code)
+          print('Patched all.sh to compile only 87 shared DRM objects')
           PY
           for script in all.sh all-i915.sh cc.sh cc-i915.sh one.sh; do
             bash -n "NullMoth/gpu-port/xkpi/$script"
@@ -357,6 +405,11 @@ jobs:
           python3.14 - <<'PY'
           from pathlib import Path
           sources = [Path(s) for s in Path('srcs.txt').read_text().splitlines() if s.strip()]
+          if len(sources) != 87:
+              raise SystemExit(f'Expected 87 shared DRM sources; found {len(sources)}')
+          objects = list(Path('obj').glob('*.o'))
+          if len(objects) != 87:
+              raise SystemExit(f'Expected 87 freshly compiled DRM objects; found {len(objects)}')
           missing = [s.name for s in sources if not (Path('obj') / (s.stem + '.o')).is_file()]
           if missing:
               raise SystemExit('Missing DRM outputs: ' + ', '.join(missing))
@@ -411,7 +464,7 @@ jobs:
           echo "Total kernel objects: $total"
           if [ "$total" -ne 438 ]; then
             echo "ERROR: frozen upstream kernel linker expects 438 objects, found $total" >&2
-            echo 'This is not a request to change the count: inspect kernel compilation logs.' >&2
+            echo 'Expected 87 DRM/TTM + 274 i915 + 49 LinuxKPI + 18 compat + 10 XNU.' >&2
             exit 1
           fi
           if [ "$LINKER_INPUT" != auto ]; then
@@ -458,7 +511,8 @@ jobs:
           done
           mkdir -p ci-artifacts/kernel-debug ci-artifacts/staged
           for name in all.sh all-i915.sh cc.sh cc-i915.sh one.sh \
-                      fork_i915_gem_mman.py srcs.all srcs.txt srcs-i915.all srcs-i915.txt; do
+                      fork_i915_gem_mman.py filter_intel_drm_sources.py srcs-excluded-amd.txt \
+                      srcs.all srcs.txt srcs-i915.all srcs-i915.txt; do
             source="NullMoth/gpu-port/xkpi/$name"
             [ ! -f "$source" ] || cp "$source" "ci-artifacts/kernel-debug/$name"
           done
