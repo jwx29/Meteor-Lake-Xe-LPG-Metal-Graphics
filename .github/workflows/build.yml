@@ -113,6 +113,44 @@ jobs:
           echo 'Plugin build scripts present:'
           find desktop-sources -maxdepth 1 -name 'build-windowserver-*.py' -print
 
+      - name: Audit available install-runtime components before the long build
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3.14 - <<'PY'
+          from pathlib import Path
+          import plistlib
+          root=Path.cwd()
+          expected={
+              'LatitudeMTLFB': ('0.2.12', [
+                  'desktop-build/LatitudeMTLFB.kext',
+                  'latitude-runtime/Library/Extensions/LatitudeMTLFB.kext',
+                  'upstream-runtime/Library/Extensions/LatitudeMTLFB.kext',
+                  'latitude-desktop/Library/Extensions/LatitudeMTLFB.kext']),
+              'NMXAccel': ('0.2.9', [
+                  'accel-build/NMXAccel.kext',
+                  'latitude-runtime/Library/Extensions/NMXAccel.kext',
+                  'upstream-runtime/Library/Extensions/NMXAccel.kext']),
+          }
+          for component,(required,paths) in expected.items():
+              found=[]
+              for rel in paths:
+                  path=root/rel/'Contents/Info.plist'
+                  if path.is_file():
+                      pl=plistlib.loads(path.read_bytes())
+                      found.append((rel,str(pl.get('CFBundleVersion','unknown'))))
+              print(component, 'available:', found or 'none')
+              if not any(version==required for _,version in found):
+                  print(f'::warning::{component} {required} not available in the checked-out runtime. '
+                        'The build may succeed, but verified installation packaging will not pass. '
+                        'A development ZIP will still be uploaded.')
+          if (root/'desktop-sources/build.py').is_file():
+              source=(root/'desktop-sources/build.py').read_text()
+              if "'0.2.3'" in source and "'0.2.12'" not in source:
+                  print('::notice::The current framebuffer builder stamps 0.2.3, not 0.2.12. '
+                        'Do not relabel it; this is not the complete newer framebuffer.')
+          PY
+
       - name: Verify dual GPU PCI matching
         shell: bash
         run: |
@@ -726,10 +764,30 @@ jobs:
                   copytree(accel_src, accel_dst)
                   kext_valid(accel_dst, expected_version=REQUIRED_ACCEL_VERSION)
           
-                  fb_candidates = [root / 'desktop-build/LatitudeMTLFB.kext',
-                                   root / 'latitude-desktop/Library/Extensions/LatitudeMTLFB.kext']
-                  fb_src = next((p for p in fb_candidates if p.is_dir() and str(readplist(p / 'Contents/Info.plist').get('CFBundleVersion','')) == REQUIRED_FB_VERSION), None)
-                  check(fb_src is not None, f'No LatitudeMTLFB {REQUIRED_FB_VERSION} build found. Checked: {fb_candidates}. Old build.py output is not suitable for this 0.3.19 runtime.')
+                  # Prefer a real 0.2.12 candidate from either the fresh build
+                  # directory or a checked-in versioned runtime. build.py's
+                  # legacy 0.2.3 output must never be relabelled as 0.2.12.
+                  fb_candidates = [root / x for x in (
+                      'desktop-build/LatitudeMTLFB.kext',
+                      'latitude-runtime/Library/Extensions/LatitudeMTLFB.kext',
+                      'upstream-runtime/Library/Extensions/LatitudeMTLFB.kext',
+                      'latitude-desktop/Library/Extensions/LatitudeMTLFB.kext',
+                  )]
+                  available = []
+                  fb_src = None
+                  for candidate in fb_candidates:
+                      if not (candidate / 'Contents/Info.plist').is_file():
+                          continue
+                      v = str(readplist(candidate / 'Contents/Info.plist').get('CFBundleVersion',''))
+                      available.append(f'{candidate.relative_to(root)}={v}')
+                      if v == REQUIRED_FB_VERSION:
+                          kext_valid(candidate, expected_version=REQUIRED_FB_VERSION)
+                          fb_src = candidate
+                          break
+                  check(fb_src is not None,
+                        f'No LatitudeMTLFB {REQUIRED_FB_VERSION} build found; '
+                        f'available: {available or "none"}. '
+                        'The old build.py outputs 0.2.3; never change just the version string.')
                   fb_dst = payload / 'Library/Extensions/LatitudeMTLFB.kext'
                   copytree(fb_src, fb_dst)
                   kext_valid(fb_dst, expected_version=REQUIRED_FB_VERSION)
@@ -1324,9 +1382,10 @@ jobs:
           set -euo pipefail
           python3.14 ci-package-tools/test_packager.py 2>&1 | tee ci-logs/install-packager-test.log
 
-      - name: Assemble full installation ZIP (strict version and layout gate)
+      - name: Assemble verified installation ZIP (only with compatible components)
         id: install_package
         shell: bash
+        continue-on-error: true
         run: |
           set -euo pipefail
           mkdir -p ci-install
@@ -1345,7 +1404,192 @@ jobs:
           rm -rf ci-install/extract-test
           shasum -a 256 ci-install/XeLPG-7D55-Sequoia-x86_64.zip | tee ci-install/ZIP-SHA256.txt
 
-      - name: Upload ready-to-stage installation ZIP
+      - name: Package real build outputs as a development ZIP
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ci-package-tools ci-install ci-logs
+          cat > ci-package-tools/make-dev-zip.py <<'XELPG_DEV_PACKAGER'
+          #!/usr/bin/env python3
+          """Publish CI build outputs without claiming the experimental GPU port is installable."""
+          from __future__ import annotations
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import plistlib
+          import shutil
+          import sys
+          import tempfile
+          import zipfile
+
+          root = Path.cwd().resolve()
+          run = os.environ.get('GITHUB_RUN_NUMBER', 'local')
+          sha = os.environ.get('GITHUB_SHA', 'unknown')
+          target = root / 'ci-install' / f'XeLPG-7D55-Development-{run}.zip'
+          expected = {'NMXGPU':'1.0.15', 'NMXAccel':'0.2.9',
+                      'LatitudeMTLFB':'0.2.12', 'NVMTLDriver':'0.3.19'}
+          record = {}
+          observed = {}
+
+          def copy_file(src: Path, dst: Path, label: str) -> bool:
+              if not src.is_file():
+                  return False
+              dst.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copy2(src, dst)
+              record[label] = str(src.relative_to(root))
+              return True
+
+          def copy_tree(src: Path, dst: Path, label: str) -> bool:
+              if not src.is_dir():
+                  return False
+              dst.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copytree(src, dst, symlinks=True)
+              record[label] = str(src.relative_to(root))
+              return True
+
+          def kext_version(src: Path) -> str | None:
+              p = src / 'Contents/Info.plist'
+              if not p.is_file():
+                  return None
+              try:
+                  return str(plistlib.loads(p.read_bytes()).get('CFBundleVersion', ''))
+              except (ValueError, TypeError):
+                  return None
+
+          def select_kext(candidates, version):
+              found = [root / x for x in candidates if kext_version(root / x) is not None]
+              return next((p for p in found if kext_version(p) == version), found[0] if found else None)
+
+          with tempfile.TemporaryDirectory(prefix='xelpg-dev-') as tmp:
+              package = Path(tmp) / 'XeLPG-7D55-Development'
+              package.mkdir()
+              payload = package / 'payload'
+              if copy_file(root / 'desktop-build/NMXGPU-1.0.15', payload / 'Kernel/NMXGPU-1.0.15', 'NMXGPU binary'):
+                  observed['NMXGPU'] = '1.0.15'
+              if copy_file(root / 'desktop-build/NVMTLDriver-0.3.19', payload / 'Metal/NVMTLDriver-0.3.19', 'Metal binary'):
+                  observed['NVMTLDriver'] = '0.3.19'
+              # This is a debugging archive: retain legacy outputs without relabelling them.
+              copy_file(root / 'desktop-build/NVMTLDriver-0.3.5', payload / 'Metal/NVMTLDriver-0.3.5', 'legacy Metal binary')
+              fb = select_kext(['desktop-build/LatitudeMTLFB.kext',
+                                'latitude-runtime/Library/Extensions/LatitudeMTLFB.kext',
+                                'upstream-runtime/Library/Extensions/LatitudeMTLFB.kext',
+                                'latitude-desktop/Library/Extensions/LatitudeMTLFB.kext'], '0.2.12')
+              if fb is not None:
+                  observed['LatitudeMTLFB'] = kext_version(fb)
+                  copy_tree(fb, payload / 'Library/Extensions/LatitudeMTLFB.kext', 'framebuffer kext')
+              accel = select_kext(['accel-build/NMXAccel.kext',
+                                   'latitude-runtime/Library/Extensions/NMXAccel.kext',
+                                   'upstream-runtime/Library/Extensions/NMXAccel.kext',
+                                   'latitude-desktop/Library/Extensions/NMXAccel.kext'], '0.2.9')
+              if accel is not None:
+                  observed['NMXAccel'] = kext_version(accel)
+                  copy_tree(accel, payload / 'Library/Extensions/NMXAccel.kext', 'accelerator kext')
+              copy_tree(root / 'latitude-desktop/EFI-Kexts/LatitudePanelClaim.kext',
+                        payload / 'EFI/OC/Kexts/LatitudePanelClaim.kext', 'panel claim')
+              for key in ['latitude-runtime/NVMTLDriver.bundle', 'upstream-runtime/NVMTLDriver.bundle']:
+                  if copy_tree(root / key, payload / 'Metal/NVMTLDriver.bundle', 'Metal bundle template'):
+                      break
+              for key in ['NullMoth/translator/translator/target/release/libnvmtl_translate.dylib',
+                          'NullMoth/translator/target/release/libnvmtl_translate.dylib']:
+                  if copy_file(root / key, payload / 'Runtime/lib/libnvmtl_translate.dylib', 'AIR translator'):
+                      break
+              prefix = Path(os.environ.get('XELPG_PREFIX', '/nonexistent-xelpg-prefix'))
+              if prefix.is_absolute() and prefix.is_relative_to(root):
+                  copy_tree(prefix / 'lib', payload / 'Runtime/staged-lib', 'ANV/libdrm')
+              elif prefix.is_absolute() and (prefix / 'lib').is_dir():
+                  # Prefix is normally in RUNNER_TEMP (outside workspace).
+                  shutil.copytree(prefix / 'lib', payload / 'Runtime/staged-lib', symlinks=True)
+                  record['ANV/libdrm'] = str(prefix / 'lib')
+              copy_tree(root / 'firmware/i915', payload / 'Firmware/i915', 'Intel i915 firmware')
+              copy_tree(root / 'latitude-runtime/tools', package / 'tests/upstream-tools', 'upstream GPU tests')
+              for name in ('test-readback.sh', 'collect-desktop-failure.sh', 'install-windowserver.sh'):
+                  copy_file(root / 'latitude-desktop' / name, package / 'references' / name, f'upstream {name}')
+              copy_file(root / 'latitude-runtime/rollback-runtime.sh', package / 'references/rollback-runtime.sh', 'upstream rollback')
+              copy_file(root / 'firmware/LICENSE.i915', package / 'licenses/LICENSE.i915', 'firmware license')
+              copy_file(root / 'LICENSE', package / 'licenses/LICENSE', 'project license')
+              mismatches = [f'{name}: {observed.get(name, "missing")} (needs {version})'
+                            for name, version in expected.items() if observed.get(name) != version]
+              info = {
+                  'type': 'DEVELOPMENT-ONLY / NOT INSTALL-READY',
+                  'commit': sha, 'required_versions': expected, 'observed_versions': observed,
+                  'missing_or_incompatible': mismatches, 'sources': record,
+                  'hardware_tested_8086_7d55': False,
+                  'warning': 'Do not inject kexts, replace WindowServer, or modify OpenCore using this archive.'
+              }
+              (package / 'build-manifest.json').write_text(json.dumps(info, indent=2) + '\n')
+              (package / 'README.md').write_text(
+                  '# Xe-LPG 7D55 — development outputs, NOT an installer\n\n'
+                  'This contains real CI binaries and any available runtime components.\n'
+                  'The included framebuffer may be legacy 0.2.3; binaries have not been relabelled.\n'
+                  'Do not install these kexts or enable experimental GPU acceleration.\n'
+                  'Use the separately uploaded XeLPG-7D55-Install artifact only if the strict compatibility gate passes.\n'
+                  'Read build-manifest.json to see exactly what is missing.\n'
+                  'The files under references/ are for study, not an automated installer.\n\n'
+                  'Missing or incompatible components:\n' +
+                  '\n'.join('- ' + m for m in mismatches) + '\n'
+              )
+              inspector = package / 'inspect.sh'
+              inspector.write_text('''#!/bin/bash
+          set -euo pipefail
+          cd "$(dirname "$0")"
+          echo 'Checking archive content integrity'
+          shasum -a 256 -c SHA256SUMS.txt
+          echo 'Build manifest:'
+          cat build-manifest.json
+          if command -v system_profiler >/dev/null 2>&1; then
+              system_profiler SPDisplaysDataType || true
+          fi
+          if command -v kmutil >/dev/null 2>&1; then
+              kmutil showloaded | grep -Ei 'NMX|Latitude' || true
+          fi
+          echo 'DEVELOPMENT BUILD ONLY: no installation performed.'
+          ''')
+              inspector.chmod(0o755)
+              installer = package / 'install.sh'
+              installer.write_text('''#!/bin/bash
+          echo 'REFUSED: This is a development artifact, NOT an installation-ready runtime.' >&2
+          echo 'Obtain the separate verified XeLPG-7D55-Install package if it becomes available.' >&2
+          exit 2
+          ''')
+              installer.chmod(0o755)
+              files = (f for f in sorted(package.rglob('*')) if f.is_file() and not f.is_symlink() and f.name != 'SHA256SUMS.txt')
+              (package / 'SHA256SUMS.txt').write_text('\n'.join(
+                  f'{hashlib.sha256(f.read_bytes()).hexdigest()}  {f.relative_to(package)}' for f in files) + '\n')
+              target.parent.mkdir(parents=True, exist_ok=True)
+              with zipfile.ZipFile(target, 'w', zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as z:
+                  for f in sorted(package.rglob('*')):
+                      if f.is_dir():
+                          continue
+                      arc = str(f.relative_to(package.parent))
+                      if f.is_symlink():
+                          out = zipfile.ZipInfo(arc)
+                          out.create_system = 3
+                          out.external_attr = (0o120777 << 16)
+                          z.writestr(out, os.readlink(f))
+                      else:
+                          z.write(f, arc)
+              with zipfile.ZipFile(target) as z:
+                  assert z.testzip() is None
+                  assert 'XeLPG-7D55-Development/build-manifest.json' in z.namelist()
+              print('Created:', target, f'({target.stat().st_size:,} bytes)')
+              print('Actual versions:', observed)
+              print('Not install-ready:', mismatches)
+          XELPG_DEV_PACKAGER
+          python3.14 ci-package-tools/make-dev-zip.py 2>&1 | tee ci-logs/development-package.log
+          unzip -t ci-install/XeLPG-7D55-Development-${{ github.run_number }}.zip | tail -n 1
+
+      - name: Upload development ZIP (not install-ready)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: XeLPG-7D55-Development-${{ github.run_number }}
+          path: ci-install/XeLPG-7D55-Development-${{ github.run_number }}.zip
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload verified installation ZIP
         if: ${{ success() && steps.install_package.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
