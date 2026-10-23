@@ -57,6 +57,12 @@ jobs:
           print('PyYAML:', yaml.__version__)
           PY
 
+      - name: Test installation packager (no GPU required)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3.14 .github/xelpg/test_packager.py
+
       - name: Install macOS build dependencies
         shell: bash
         run: |
@@ -133,6 +139,46 @@ jobs:
               raise SystemExit(f'{path} does not contain both PCI matches; missing: {absent}. Commit your 7D55 patches to the fork before building.')
           PY
 
+      - name: Fail fast on missing installation runtime sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3.14 - <<'PY'
+          from pathlib import Path
+          import plistlib
+          required = [
+              Path('desktop-sources/build-windowserver-0.3.19.py'),
+              Path('desktop-sources/publish-scanout-copy-0.3.19.py'),
+              Path('firmware/i915'),
+              Path('latitude-runtime'),
+              Path('accel-build/NMXAccel.kext/Contents/Info.plist'),
+              Path('latitude-runtime/rollback-runtime.sh'),
+          ]
+          missing = [str(p) for p in required if not p.exists()]
+          if missing:
+              raise SystemExit('Missing current install-runtime inputs (merge/build upstream candidates first):\n' + '\n'.join(missing))
+          accel = plistlib.loads(Path('accel-build/NMXAccel.kext/Contents/Info.plist').read_bytes())
+          if str(accel.get('CFBundleVersion','')) != '0.2.9':
+              raise SystemExit('Expected NMXAccel 0.2.9, got ' + str(accel.get('CFBundleVersion')))
+          fb = Path('desktop-build/LatitudeMTLFB.kext/Contents/Info.plist')
+          if fb.exists():
+              info = plistlib.loads(fb.read_bytes())
+              if str(info.get('CFBundleVersion','')) != '0.2.12':
+                  raise SystemExit('Expected current framebuffer 0.2.12, found ' + str(info.get('CFBundleVersion')))
+          installers = [Path('latitude-desktop/install-windowserver.sh'),
+                        Path('latitude-runtime/install-windowserver.sh'),
+                        Path('install-windowserver.sh')]
+          if not any(p.is_file() for p in installers):
+              raise SystemExit('Missing upstream install-windowserver.sh (original USB installer). Do not package without its actual install logic.')
+          roots = [Path('latitude-runtime'),Path('desktop-build'),
+                   Path('upstream-runtime'),Path('NullMoth/plugin')]
+          if not any((p/'Contents/Info.plist').is_file()
+                     for root in roots if root.is_dir()
+                     for p in root.rglob('NVMTLDriver.bundle')):
+              raise SystemExit('No NVMTLDriver.bundle template available. Cannot install a raw plugin binary alone.')
+          print('PASS: current runtime source candidates are available')
+          PY
+
       - name: Build AIR to SPIR-V translator
         shell: bash
         run: |
@@ -172,16 +218,21 @@ jobs:
           meson install -C build-tree/mesa-build 2>&1 | tee ci-logs/mesa-install.log
           find "$XELPG_PREFIX" -name '*vulkan*intel*' -o -name 'libdrm*.dylib' | head -n 30
 
-      - name: Build Metal plugin (documented standalone builder)
+      - name: Build Metal plugin 0.3.19 (current upstream runtime)
         shell: bash
         run: |
           set -euo pipefail
-          # The README's standalone builder produces 0.3.5; later 0.3.19
-          # candidate scripts are patch/publish steps, not a guaranteed
-          # drop-in replacement. Do not run USB publishing scripts on CI.
-          script=desktop-sources/build-windowserver-0.3.5.py
-          test -f "$script" || { echo "Missing documented plugin builder: $script" >&2; exit 1; }
+          # Do not mix the old 0.3.5 standalone plugin with the current
+          # NMXGPU 1.0.15 + NMXAccel 0.2.9 runtime.
+          script=desktop-sources/build-windowserver-0.3.19.py
+          test -f "$script" || {
+            echo "Missing $script. Merge current upstream build scripts into the fork before producing an install-ready package." >&2
+            exit 1
+          }
           python3.14 "$script" 2>&1 | tee ci-logs/plugin.log
+          test -s desktop-build/NVMTLDriver-0.3.19 || {
+            echo 'Missing freshly compiled NVMTLDriver-0.3.19' >&2; exit 1;
+          }
 
       - name: Make upstream kernel paths portable and filter Intel DRM
         shell: bash
@@ -560,6 +611,45 @@ jobs:
         run: |
           set -euo pipefail
           python3.14 desktop-sources/build.py 2>&1 | tee ci-logs/framebuffer.log
+
+      - name: Verify packager scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3.14 -m py_compile .github/xelpg/packager.py
+          for f in .github/xelpg/scripts/*.sh; do bash -n "$f"; done
+
+      - name: Assemble complete 7D55 installation package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist ci-logs
+          python3.14 .github/xelpg/packager.py \
+            --repo "$GITHUB_WORKSPACE" \
+            --templates "$GITHUB_WORKSPACE/.github/xelpg/scripts" \
+            --sha "$GITHUB_SHA" \
+            --out "$GITHUB_WORKSPACE/dist/XeLPG-7D55-macOS15-${GITHUB_RUN_NUMBER}.zip" \
+            2>&1 | tee ci-logs/packaging.log
+
+      - name: Smoke-test packaged ZIP on macOS
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$(find dist -maxdepth 1 -type f -name 'XeLPG-7D55-macOS15-*.zip' -print -quit)"
+          test -s "$archive"
+          scratch="$(mktemp -d)"
+          trap 'rm -rf "$scratch"' EXIT
+          unzip -q "$archive" -d "$scratch"
+          "$scratch/XeLPG-7D55/check.sh" 2>&1 | tee ci-logs/package-smoke-test.log
+          echo "Verified install ZIP: $archive"
+
+      - name: Upload install-ready ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: XeLPG-7D55-Install-${{ github.run_number }}
+          path: dist/XeLPG-7D55-macOS15-*.zip
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Package CI results (no USB publishing or install)
         if: always()
