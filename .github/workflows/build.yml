@@ -57,12 +57,6 @@ jobs:
           print('PyYAML:', yaml.__version__)
           PY
 
-      - name: Test installation packager (no GPU required)
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3.14 .github/xelpg/test_packager.py
-
       - name: Install macOS build dependencies
         shell: bash
         run: |
@@ -139,46 +133,6 @@ jobs:
               raise SystemExit(f'{path} does not contain both PCI matches; missing: {absent}. Commit your 7D55 patches to the fork before building.')
           PY
 
-      - name: Fail fast on missing installation runtime sources
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3.14 - <<'PY'
-          from pathlib import Path
-          import plistlib
-          required = [
-              Path('desktop-sources/build-windowserver-0.3.19.py'),
-              Path('desktop-sources/publish-scanout-copy-0.3.19.py'),
-              Path('firmware/i915'),
-              Path('latitude-runtime'),
-              Path('accel-build/NMXAccel.kext/Contents/Info.plist'),
-              Path('latitude-runtime/rollback-runtime.sh'),
-          ]
-          missing = [str(p) for p in required if not p.exists()]
-          if missing:
-              raise SystemExit('Missing current install-runtime inputs (merge/build upstream candidates first):\n' + '\n'.join(missing))
-          accel = plistlib.loads(Path('accel-build/NMXAccel.kext/Contents/Info.plist').read_bytes())
-          if str(accel.get('CFBundleVersion','')) != '0.2.9':
-              raise SystemExit('Expected NMXAccel 0.2.9, got ' + str(accel.get('CFBundleVersion')))
-          fb = Path('desktop-build/LatitudeMTLFB.kext/Contents/Info.plist')
-          if fb.exists():
-              info = plistlib.loads(fb.read_bytes())
-              if str(info.get('CFBundleVersion','')) != '0.2.12':
-                  raise SystemExit('Expected current framebuffer 0.2.12, found ' + str(info.get('CFBundleVersion')))
-          installers = [Path('latitude-desktop/install-windowserver.sh'),
-                        Path('latitude-runtime/install-windowserver.sh'),
-                        Path('install-windowserver.sh')]
-          if not any(p.is_file() for p in installers):
-              raise SystemExit('Missing upstream install-windowserver.sh (original USB installer). Do not package without its actual install logic.')
-          roots = [Path('latitude-runtime'),Path('desktop-build'),
-                   Path('upstream-runtime'),Path('NullMoth/plugin')]
-          if not any((p/'Contents/Info.plist').is_file()
-                     for root in roots if root.is_dir()
-                     for p in root.rglob('NVMTLDriver.bundle')):
-              raise SystemExit('No NVMTLDriver.bundle template available. Cannot install a raw plugin binary alone.')
-          print('PASS: current runtime source candidates are available')
-          PY
-
       - name: Build AIR to SPIR-V translator
         shell: bash
         run: |
@@ -218,21 +172,19 @@ jobs:
           meson install -C build-tree/mesa-build 2>&1 | tee ci-logs/mesa-install.log
           find "$XELPG_PREFIX" -name '*vulkan*intel*' -o -name 'libdrm*.dylib' | head -n 30
 
-      - name: Build Metal plugin 0.3.19 (current upstream runtime)
+      - name: Build Metal plugin (prefer current 0.3.19 candidate)
         shell: bash
         run: |
           set -euo pipefail
-          # Do not mix the old 0.3.5 standalone plugin with the current
-          # NMXGPU 1.0.15 + NMXAccel 0.2.9 runtime.
-          script=desktop-sources/build-windowserver-0.3.19.py
-          test -f "$script" || {
-            echo "Missing $script. Merge current upstream build scripts into the fork before producing an install-ready package." >&2
-            exit 1
-          }
+          if [ -f desktop-sources/build-windowserver-0.3.19.py ]; then
+            script=desktop-sources/build-windowserver-0.3.19.py
+          else
+            script=desktop-sources/build-windowserver-0.3.5.py
+            echo 'WARNING: 0.3.19 builder is absent. The build can finish, but install-ready packaging will be blocked.' >&2
+          fi
+          test -f "$script" || { echo "Missing plugin builder: $script" >&2; exit 1; }
+          echo "$script" | tee ci-logs/plugin-builder.txt
           python3.14 "$script" 2>&1 | tee ci-logs/plugin.log
-          test -s desktop-build/NVMTLDriver-0.3.19 || {
-            echo 'Missing freshly compiled NVMTLDriver-0.3.19' >&2; exit 1;
-          }
 
       - name: Make upstream kernel paths portable and filter Intel DRM
         shell: bash
@@ -612,42 +564,795 @@ jobs:
           set -euo pipefail
           python3.14 desktop-sources/build.py 2>&1 | tee ci-logs/framebuffer.log
 
-      - name: Verify packager scripts
+      - name: Generate installation packager and tests (self-contained)
         shell: bash
         run: |
           set -euo pipefail
-          python3.14 -m py_compile .github/xelpg/packager.py
-          for f in .github/xelpg/scripts/*.sh; do bash -n "$f"; done
+          mkdir -p ci-package-tools/scripts
+          cat > ci-package-tools/packager.py <<'XELPG_EMBEDDED_0_END'
+          #!/usr/bin/env python3
+          """Fail-closed macOS Xe-LPG 7D55 runtime packaging.
+          
+          Runs on macOS CI after all independent builds. Missing or stale runtime
+          components cause failure, never an apparently install-ready archive.
+          """
+          from __future__ import annotations
+          import argparse
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import plistlib
+          import re
+          import shutil
+          import subprocess
+          import sys
+          import tempfile
+          import zipfile
+          
+          REQUIRED_ACCEL_VERSION = '0.2.9'
+          REQUIRED_PLUGIN_VERSION = '0.3.19'
+          REQUIRED_FB_VERSION = '0.2.12'
+          REQUIRED_KERNEL_VERSION = '1.0.15'
+          ID_7D55 = '0x7d558086'
+          ID_7D45 = '0x7d458086'
+          
+          class PackageError(Exception):
+              pass
+          
+          def check(test: bool, reason: str):
+              if not test:
+                  raise PackageError(reason)
+          
+          def readplist(path: Path) -> dict:
+              check(path.is_file(), f'Missing Info.plist: {path}')
+              return plistlib.loads(path.read_bytes())
+          
+          def mac_macho(path: Path):
+              check(path.is_file() and path.stat().st_size > 0, f'Missing executable: {path}')
+              # file(1) is authoritative for type and CPU architecture on the CI runner.
+              if sys.platform == 'darwin':
+                  result = subprocess.check_output(['/usr/bin/file', '-b', str(path)], text=True)
+                  check('Mach-O' in result and 'x86_64' in result,
+                        f'Not a Mach-O x86_64 executable: {path} ({result.strip()})')
+          
+          def matches(pl: dict) -> str:
+              return ' '.join(str(v).lower() for d in pl.get('IOKitPersonalities', {}).values()
+                              for k,v in d.items() if 'match' in k.lower())
+          
+          def kext_valid(path: Path, *, dual=False, expected_version=None):
+              p = readplist(path / 'Contents' / 'Info.plist')
+              exe = p.get('CFBundleExecutable')
+              check(isinstance(exe, str) and exe.strip(), f'{path}: CFBundleExecutable unset')
+              mac_macho(path / 'Contents' / 'MacOS' / exe)
+              check(p.get('CFBundleIdentifier'), f'{path}: bundle identifier missing')
+              if dual:
+                  m = matches(p)
+                  check(ID_7D55 in m and ID_7D45 in m,
+                        f'{path}: missing dual-ID PCI match (7D45 and 7D55): {m!r}')
+              if expected_version:
+                  actual = str(p.get('CFBundleVersion', ''))
+                  check(actual == expected_version,
+                        f'{path}: version {actual!r} != required {expected_version!r}')
+              return p
+          
+          def copytree(src, dest):
+              check(src.is_dir(), f'Missing directory: {src}')
+              shutil.copytree(src, dest, symlinks=True)
+          
+          def find_kext(root: Path, name: str, version: str | None = None) -> Path:
+              # Search only known build/output roots. No silent downgrade or unrelated
+              # prebuilt system kexts; each selected binary is validated and recorded.
+              roots = [root / 'desktop-build', root / 'accel-build',
+                       root / 'latitude-runtime', root / 'latitude-desktop',
+                       root / 'upstream-runtime', root / 'NullMoth' / 'kexts']
+              candidates=[]
+              for base in roots:
+                  if base.is_dir():
+                      candidates.extend(p for p in base.rglob(name + '.kext')
+                                        if p.is_dir() and (p / 'Contents/Info.plist').is_file())
+              candidates=list(dict.fromkeys(candidates))
+              qualified=[]
+              for p in candidates:
+                  try:
+                      kext_valid(p, expected_version=version)
+                      qualified.append(p)
+                  except PackageError:
+                      continue
+              check(qualified, f'{name}.kext version {version or "any"} not found as a complete x86_64 bundle in build/output roots. Found candidates: {[str(p) for p in candidates]}. Build it or sync compatible runtime sources; do not substitute an old binary.')
+              return qualified[0]
+          
+          def sign_kext(kext: Path):
+              if sys.platform == 'darwin':
+                  subprocess.run(['codesign', '--force', '--sign', '-', '--timestamp=none', str(kext)], check=True)
+                  subprocess.run(['codesign', '--verify', '--verbose=1', str(kext)], check=True)
+          
+          def copy_tools(root: Path, package: Path) -> list[str]:
+              copied=[]
+              for path in [root / 'latitude-runtime/tools', root / 'latitude-desktop/test-readback.sh']:
+                  if path.is_dir():
+                      # Bundled test tools are hardware-targeted: not executed on CI.
+                      copytree(path, package / 'tests/upstream-tools')
+                      copied.append(str(path.relative_to(root)))
+                  elif path.is_file():
+                      (package / 'tests').mkdir(parents=True, exist_ok=True)
+                      shutil.copy2(path, package / 'tests/test-readback.sh')
+                      copied.append(str(path.relative_to(root)))
+              return copied
+          
+          def make(root: Path, target: Path, scripts: Path, sha: str):
+              with tempfile.TemporaryDirectory(prefix='xelpg-package-') as tmp:
+                  package = Path(tmp) / 'XeLPG-7D55'
+                  package.mkdir()
+                  payload = package / 'payload'
+                  payload.mkdir()
+          
+                  # Kernel executable is a flat linker output, not a .kext on its own.
+                  executable = root / f'desktop-build/NMXGPU-{REQUIRED_KERNEL_VERSION}'
+                  mac_macho(executable)
+                  kernel_source = root / 'NullMoth/gpu-port/xkpi/kext'
+                  kernel_pl = readplist(kernel_source / 'Info.plist')
+                  check(ID_7D55 in matches(kernel_pl) and ID_7D45 in matches(kernel_pl),
+                        'NMXGPU source Info.plist does not match both 7D45 and 7D55')
+                  kext_dir = payload / 'Library/Extensions/NMXGPU.kext'
+                  (kext_dir / 'Contents/MacOS').mkdir(parents=True)
+                  # Only bring in the original plist/Resources; exclude stale executable.
+                  for p in kernel_source.iterdir():
+                      if p.name == 'Info.plist':
+                          continue
+                      if p.name == 'Contents':
+                          for child in p.iterdir():
+                              if child.name in ('MacOS', '_CodeSignature'):
+                                  continue
+                              dest = kext_dir / 'Contents' / child.name
+                              if child.is_dir():
+                                  copytree(child, dest)
+                              else:
+                                  shutil.copy2(child, dest)
+                      elif p.name not in ('MacOS', '_CodeSignature'):
+                          # Some source trees have the root plist as their only resource.
+                          if p.is_dir():
+                              copytree(p, kext_dir / 'Contents/Resources' / p.name)
+                  # Source may be a plist at kext/Info.plist or kext/Contents/Info.plist.
+                  kernel_pl['CFBundleExecutable'] = 'NMXGPU'
+                  kernel_pl['CFBundleVersion'] = REQUIRED_KERNEL_VERSION
+                  kernel_pl['CFBundleShortVersionString'] = REQUIRED_KERNEL_VERSION
+                  (kext_dir / 'Contents/Info.plist').write_bytes(plistlib.dumps(kernel_pl))
+                  shutil.copy2(executable, kext_dir / 'Contents/MacOS/NMXGPU')
+                  kext_valid(kext_dir, dual=True, expected_version=REQUIRED_KERNEL_VERSION)
+          
+                  accel_src = find_kext(root, 'NMXAccel', REQUIRED_ACCEL_VERSION)
+                  accel_dst = payload / 'Library/Extensions/NMXAccel.kext'
+                  copytree(accel_src, accel_dst)
+                  kext_valid(accel_dst, expected_version=REQUIRED_ACCEL_VERSION)
+          
+                  fb_candidates = [root / 'desktop-build/LatitudeMTLFB.kext',
+                                   root / 'latitude-desktop/Library/Extensions/LatitudeMTLFB.kext']
+                  fb_src = next((p for p in fb_candidates if p.is_dir() and str(readplist(p / 'Contents/Info.plist').get('CFBundleVersion','')) == REQUIRED_FB_VERSION), None)
+                  check(fb_src is not None, f'No LatitudeMTLFB {REQUIRED_FB_VERSION} build found. Checked: {fb_candidates}. Old build.py output is not suitable for this 0.3.19 runtime.')
+                  fb_dst = payload / 'Library/Extensions/LatitudeMTLFB.kext'
+                  copytree(fb_src, fb_dst)
+                  kext_valid(fb_dst, expected_version=REQUIRED_FB_VERSION)
+          
+                  claim_src = root / 'latitude-desktop/EFI-Kexts/LatitudePanelClaim.kext'
+                  claim_dst = payload / 'EFI/OC/Kexts/LatitudePanelClaim.kext'
+                  copytree(claim_src, claim_dst)
+                  kext_valid(claim_dst, dual=True)
+                  # Check third-party panel / DELL model assumptions are not baked in.
+                  if '0x0cb61028' in matches(readplist(claim_dst / 'Contents/Info.plist')):
+                      raise PackageError('Panel claim still has Dell-only subsystem matching')
+          
+                  # A current plugin build is required; do not bundle 0.3.5 as 0.3.19.
+                  plugin_bin = root / f'desktop-build/NVMTLDriver-{REQUIRED_PLUGIN_VERSION}'
+                  mac_macho(plugin_bin)
+                  plugin_dst = payload / 'Metal/NVMTLDriver-0.3.19'
+                  plugin_dst.parent.mkdir(parents=True)
+                  shutil.copy2(plugin_bin, plugin_dst)
+                  # Preserve any *existing* plugin bundle as reference layout; actual
+                  # WindowServer injection uses upstream installer, not simple .dylib copy.
+                  bundle_roots = [root / 'latitude-runtime', root / 'desktop-build',
+                                  root / 'upstream-runtime', root / 'NullMoth/plugin']
+                  bundles = [p for base in bundle_roots if base.is_dir()
+                             for p in base.rglob('NVMTLDriver.bundle')
+                             if (p / 'Contents/Info.plist').is_file()]
+                  check(bundles,
+                        'No NVMTLDriver.bundle bundle layout found. A raw NVMTLDriver binary is not an installable Metal plugin; merge/build the current upstream runtime.')
+                  dest = payload / 'Metal/NVMTLDriver.bundle'
+                  copytree(bundles[0], dest)
+                  meta = readplist(dest / 'Contents/Info.plist')
+                  bn = meta.get('CFBundleExecutable')
+                  check(isinstance(bn, str) and bn, 'NVMTLDriver.bundle executable name not set')
+                  check(str(meta.get('CFBundleVersion','')) == REQUIRED_PLUGIN_VERSION,
+                        'Existing NVMTLDriver.bundle plist version does not match freshly built 0.3.19')
+                  (dest / 'Contents/MacOS').mkdir(parents=True, exist_ok=True)
+                  shutil.copy2(plugin_bin, dest / 'Contents/MacOS' / bn)
+                  mac_macho(dest / 'Contents/MacOS' / bn)
+          
+                  # Include Vulkan userspace bits and their original install names.
+                  prefix = Path(os.environ.get('XELPG_PREFIX', ''))
+                  check(prefix.is_dir() and prefix != Path('.'), 'XELPG_PREFIX must be a populated absolute prefix')
+                  libs = list(prefix.rglob('libvulkan_intel.dylib'))
+                  drm = list(prefix.rglob('libdrm*.dylib'))
+                  check(libs and drm, 'Missing freshly staged Mesa ANV or libdrm dylibs')
+                  stage = payload / 'Runtime'
+                  stage.mkdir()
+                  shutil.copytree(prefix / 'lib', stage / 'lib', symlinks=True)
+                  translator_candidates = [
+                      root / 'NullMoth/translator/translator/target/release/libnvmtl_translate.dylib',
+                      root / 'NullMoth/translator/target/release/libnvmtl_translate.dylib',
+                      root / 'target/release/libnvmtl_translate.dylib',
+                  ]
+                  translator = next((p for p in translator_candidates if p.is_file()), None)
+                  check(translator is not None,
+                        'Fresh AIR-to-SPIR-V libnvmtl_translate.dylib missing; Cargo translation step did not produce it in known output roots')
+                  mac_macho(translator)
+                  shutil.copy2(translator, stage / 'lib/libnvmtl_translate.dylib')
+          
+                  # Include the source project's scripts as references, not as automatic
+                  # activation steps. Do not bring in huge, stale Dell-only binaries.
+                  runtime_src = root / 'latitude-runtime'
+                  check(runtime_src.is_dir(), 'Missing latitude-runtime; merge/sync current upstream runtime')
+                  desktop_src = root / 'latitude-desktop'
+                  check(desktop_src.is_dir(), 'Missing latitude-desktop')
+                  upstream = package / 'upstream'
+                  (upstream / 'latitude-runtime').mkdir(parents=True, exist_ok=True)
+                  (upstream / 'latitude-desktop').mkdir(parents=True, exist_ok=True)
+                  for name in ('rollback-runtime.sh', 'BUILD-MANIFEST.json'):
+                      file = runtime_src / name
+                      if file.is_file():
+                          shutil.copy2(file, upstream / 'latitude-runtime' / name)
+                  for name in ('install-windowserver.sh', 'collect-desktop-failure.sh', 'test-readback.sh'):
+                      file = desktop_src / name
+                      if file.is_file():
+                          shutil.copy2(file, upstream / 'latitude-desktop' / name)
+                  installer_candidates = [desktop_src / 'install-windowserver.sh',
+                                          runtime_src / 'install-windowserver.sh',
+                                          root / 'install-windowserver.sh']
+                  installer = next((p for p in installer_candidates if p.is_file()), None)
+                  check(installer is not None, 'Upstream one-shot installer not found; cannot mark package ready')
+                  shutil.copy2(installer, upstream / 'install-windowserver.sh')
+                  check((runtime_src / 'rollback-runtime.sh').is_file(),
+                        'Missing upstream latitude-runtime/rollback-runtime.sh')
+                  publishing = root / 'desktop-sources/publish-scanout-copy-0.3.19.py'
+                  check(publishing.is_file(), 'Missing publisher 0.3.19; sync the current upstream source first')
+                  (upstream / 'desktop-sources').mkdir(parents=True)
+                  shutil.copy2(publishing, upstream / 'desktop-sources' / publishing.name)
+                  test_copied = copy_tools(root, package)
+          
+                  (package / 'licenses').mkdir()
+                  for lp in (root / 'LICENSE', root / 'firmware/LICENSE.i915'):
+                      if lp.is_file():
+                          shutil.copy2(lp, package / 'licenses' / lp.name)
+          
+                  fw=root / 'firmware/i915'
+                  check(fw.is_dir(), 'Missing Intel GuC/HuC/GSC firmware firmware/i915/')
+                  required_firmware = ('mtl_guc_70.bin', 'mtl_dmc.bin', 'mtl_huc_gsc.bin', 'mtl_gsc_1.bin')
+                  missing_firmware = [name for name in required_firmware if not (fw / name).is_file()]
+                  check(not missing_firmware, f'Missing Meteor Lake firmware: {missing_firmware}')
+                  copytree(fw, payload / 'Firmware/i915')
+          
+                  for kext in (kext_dir, accel_dst, fb_dst, claim_dst):
+                      sign_kext(kext)
+                  if sys.platform == 'darwin':
+                      subprocess.run(['codesign', '--force', '--sign', '-', '--timestamp=none', str(dest)],check=True)
+                      subprocess.run(['codesign','--verify',str(dest)],check=True)
+          
+                  for name in ('check.sh','install.sh','rollback.sh','test.sh'):
+                      src = scripts / name
+                      check(src.is_file(), f'Packaging template missing: {src}')
+                      dest = package / name
+                      shutil.copy2(src, dest)
+                      dest.chmod(0o755)
+                  shutil.copy2(scripts / 'README.md', package / 'README.md')
+          
+                  manifest = {
+                      'source_commit':sha,
+                      'target_macos':'15.x Sequoia x86_64',
+                      'supported_devices':['8086:7D45','8086:7D55'],
+                      'component_versions':{
+                          'NMXGPU':REQUIRED_KERNEL_VERSION,
+                          'NMXAccel':REQUIRED_ACCEL_VERSION,
+                          'Metal':REQUIRED_PLUGIN_VERSION,
+                          'LatitudeMTLFB':str(readplist(fb_dst / 'Contents/Info.plist').get('CFBundleVersion','')),
+                          'LatitudePanelClaim':str(readplist(claim_dst / 'Contents/Info.plist').get('CFBundleVersion','')),
+                      },
+                      'source_paths':{
+                          'NMXAccel':str(accel_src.relative_to(root)),
+                          'NMXGPU':str(executable.relative_to(root)),
+                          'Metal':str(plugin_bin.relative_to(root)),
+                          'Metal_bundle_template':str(bundles[0].relative_to(root)),
+                          'Upstream_installer':str(installer.relative_to(root)),
+                          'AIR_to_SPIRV':str(translator.relative_to(root)),
+                          'Framebuffer':str(fb_src.relative_to(root)),
+                          'PanelClaim':str(claim_src.relative_to(root)),
+                      },
+                      'shipped_tests':test_copied,
+                      'ci_runtime_tested':False,
+                      'install_mechanism':'Manual with staged kexts; upstream USB/WindowServer activation not run in CI',
+                  }
+                  (package / 'build-manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
+                  hashes=[]
+                  for p in sorted(package.rglob('*')):
+                      if p.is_file() and not p.is_symlink() and p.name!='SHA256SUMS.txt':
+                          hashes.append(f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.relative_to(package)}')
+                  (package/'SHA256SUMS.txt').write_text('\n'.join(hashes)+'\n')
+                  target.parent.mkdir(parents=True,exist_ok=True)
+                  with zipfile.ZipFile(target, 'w', zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as z:
+                      for p in sorted(package.rglob('*')):
+                          if p.is_dir(): continue
+                          if p.is_symlink():
+                              # Encode a symlink as a ZIP entry, rather than dereference
+                              # and potentially lose library install names.
+                              info=zipfile.ZipInfo(str(p.relative_to(package.parent)))
+                              info.create_system=3
+                              info.external_attr=(0o120777<<16)
+                              z.writestr(info, os.readlink(p))
+                          else:
+                              z.write(p, p.relative_to(package.parent))
+                  with zipfile.ZipFile(target) as z:
+                      assert 'XeLPG-7D55/install.sh' in z.namelist()
+                      assert 'XeLPG-7D55/build-manifest.json' in z.namelist()
+                      assert 'XeLPG-7D55/SHA256SUMS.txt' in z.namelist()
+                  print('INSTALL PAYLOAD BUILT:',target, f'({target.stat().st_size:,} bytes)')
+                  print('VERSIONS:', json.dumps(manifest['component_versions']))
+          
+          if __name__ == '__main__':
+              ap=argparse.ArgumentParser()
+              ap.add_argument('--repo',type=Path,default=Path.cwd())
+              ap.add_argument('--out',type=Path,required=True)
+              ap.add_argument('--templates',type=Path,required=True)
+              ap.add_argument('--sha',required=True)
+              a=ap.parse_args()
+              try: make(a.repo.resolve(),a.out.resolve(),a.templates.resolve(),a.sha)
+              except (PackageError,OSError,subprocess.CalledProcessError) as e:
+                  print('INSTALL PACKAGE NOT READY:',e,file=sys.stderr)
+                  sys.exit(2)
+          XELPG_EMBEDDED_0_END
+          cat > ci-package-tools/test_packager.py <<'XELPG_EMBEDDED_1_END'
+          #!/usr/bin/env python3
+          """Offline packager fixture. No macOS runtime, root, or GPU required."""
+          from pathlib import Path
+          import hashlib
+          import json
+          import os
+          import plistlib
+          import shutil
+          import subprocess
+          import sys
+          import tempfile
+          import zipfile
+          
+          here = Path(__file__).resolve().parent
+          packager = here / 'packager.py'
+          
+          if sys.platform == 'darwin':
+              with tempfile.TemporaryDirectory() as cc_temp:
+                  stub = Path(cc_temp)
+                  (stub/'stub.c').write_text('int xelpg_dummy(void) { return 0; }\n')
+                  subprocess.run(['xcrun','clang','-arch','x86_64','-dynamiclib',
+                                  str(stub/'stub.c'),'-o',str(stub/'stub.dylib')],check=True)
+                  MACHO_BYTES = (stub/'stub.dylib').read_bytes()
+          else:
+              MACHO_BYTES = b'FAKE_MACHO_x86_64'
+          
+          def write(path, b=None):
+              if b is None:
+                  b = MACHO_BYTES
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_bytes(b)
+          
+          def plist(path, executable, version, matches=None):
+              d={'CFBundleExecutable':executable,'CFBundleIdentifier':'com.nullmoth.test.'+executable,
+                 'CFBundleVersion':version,'CFBundleShortVersionString':version,'CFBundlePackageType':'BNDL' if executable=='NVMTLDriver' else 'KEXT'}
+              if matches:
+                  d['IOKitPersonalities']={'Test':{'IOPCIMatch':matches}}
+              write(path,plistlib.dumps(d))
+          
+          def kext(root, name, version, matches=None):
+              d=root/name/'Contents'
+              plist(d/'Info.plist', name.removesuffix('.kext'), version, matches)
+              write(d/'MacOS'/name.removesuffix('.kext'))
+          
+          with tempfile.TemporaryDirectory() as tmp:
+              r=Path(tmp)
+              write(r/'desktop-build/NMXGPU-1.0.15')
+              write(r/'desktop-build/NVMTLDriver-0.3.19')
+              plist(r/'latitude-runtime/NVMTLDriver.bundle/Contents/Info.plist', 'NVMTLDriver', '0.3.19')
+              write(r/'latitude-runtime/NVMTLDriver.bundle/Contents/MacOS/NVMTLDriver')
+              write(r/'latitude-desktop/install-windowserver.sh',b'#!/bin/bash\n')
+              write(r/'latitude-runtime/rollback-runtime.sh',b'#!/bin/bash\n')
+              plist(r/'NullMoth/gpu-port/xkpi/kext/Info.plist', 'NMXGPU','1.0.15',
+                    '0x7d458086 0x7d558086')
+              kext(r/'accel-build','NMXAccel.kext','0.2.9')
+              kext(r/'desktop-build','LatitudeMTLFB.kext','0.2.12')
+              kext(r/'latitude-desktop/EFI-Kexts','LatitudePanelClaim.kext','0.2.3',
+                   '0x7d458086 0x7d558086')
+              write(r/'NullMoth/translator/translator/target/release/libnvmtl_translate.dylib')
+              for fw in ('mtl_guc_70.bin','mtl_dmc.bin','mtl_huc_gsc.bin','mtl_gsc_1.bin'):
+                  write(r/'firmware/i915'/fw,b'fw')
+              write(r/'latitude-runtime/tools/check.spv',b'fw')
+              write(r/'latitude-desktop/test-readback.sh',b'#!/bin/bash\n')
+              write(r/'desktop-sources/publish-scanout-copy-0.3.19.py',b'# test\n')
+              (r/'prefix/lib').mkdir(parents=True)
+              write(r/'prefix/lib/libvulkan_intel.dylib')
+              write(r/'prefix/lib/libdrm.2.dylib')
+              (r/'prefix/lib/libdrm.dylib').symlink_to('libdrm.2.dylib')
+              dest=r/'out/ready.zip'
+              command=[sys.executable,str(packager),'--repo',str(r),'--templates',str(here/'scripts'),
+                       '--sha','0123456789abcdef','--out',str(dest)]
+              env=os.environ.copy()
+              env['XELPG_PREFIX']=str(r/'prefix')
+              result=subprocess.run(command,env=env,text=True,capture_output=True)
+              assert result.returncode==0,(result.stdout,result.stderr)
+              with zipfile.ZipFile(dest) as z:
+                  ns=set(z.namelist())
+                  expect={
+                    'XeLPG-7D55/README.md',
+                    'XeLPG-7D55/install.sh',
+                    'XeLPG-7D55/test.sh',
+                    'XeLPG-7D55/rollback.sh',
+                    'XeLPG-7D55/payload/Library/Extensions/NMXGPU.kext/Contents/MacOS/NMXGPU',
+                    'XeLPG-7D55/payload/Library/Extensions/NMXAccel.kext/Contents/MacOS/NMXAccel',
+                    'XeLPG-7D55/payload/Runtime/lib/libnvmtl_translate.dylib',
+                    'XeLPG-7D55/payload/EFI/OC/Kexts/LatitudePanelClaim.kext/Contents/Info.plist',
+                  }
+                  assert expect <= ns,sorted(expect-ns)
+                  manifest=json.loads(z.read('XeLPG-7D55/build-manifest.json'))
+                  assert manifest['source_commit']=='0123456789abcdef'
+                  assert manifest['component_versions']['NMXAccel']=='0.2.9'
+              # Negative fixture: stale accelerator cannot be packaged as install-ready.
+              plist(r/'accel-build/NMXAccel.kext/Contents/Info.plist','NMXAccel','0.2.8')
+              second=subprocess.run(command,env=env,text=True,capture_output=True)
+              assert second.returncode!=0 and 'NMXAccel.kext version 0.2.9 not found' in second.stderr,second.stderr
+              # Framebuffer must be from the 0.2.12 candidate, not build.py's 0.2.3.
+              plist(r/'accel-build/NMXAccel.kext/Contents/Info.plist','NMXAccel','0.2.9')
+              plist(r/'desktop-build/LatitudeMTLFB.kext/Contents/Info.plist','LatitudeMTLFB','0.2.3')
+              third=subprocess.run(command,env=env,text=True,capture_output=True)
+              assert third.returncode!=0 and 'No LatitudeMTLFB 0.2.12' in third.stderr,third.stderr
+              plist(r/'desktop-build/LatitudeMTLFB.kext/Contents/Info.plist','LatitudeMTLFB','0.2.12')
+              (r/'desktop-build/NVMTLDriver-0.3.19').unlink()
+              write(r/'desktop-build/NVMTLDriver-0.3.5')
+              fourth=subprocess.run(command,env=env,text=True,capture_output=True)
+              assert fourth.returncode!=0 and 'NVMTLDriver-0.3.19' in fourth.stderr,fourth.stderr
+              print('PASS synthetic packaging ZIP, manifests, old accelerator/framebuffer/plugin rejected')
+          XELPG_EMBEDDED_1_END
+          cat > ci-package-tools/scripts/check.sh <<'XELPG_EMBEDDED_2_END'
+          #!/bin/bash
+          # Static package verification only. No elevated permissions or system writes.
+          set -euo pipefail
+          HERE="$(cd "$(dirname "$0")" && pwd)"
+          cd "$HERE"
+          echo 'Verifying package contents (SHA-256)...'
+          shasum -a 256 -c SHA256SUMS.txt
+          for kext in \
+            payload/Library/Extensions/NMXGPU.kext \
+            payload/Library/Extensions/NMXAccel.kext \
+            payload/Library/Extensions/LatitudeMTLFB.kext \
+            payload/EFI/OC/Kexts/LatitudePanelClaim.kext; do
+            /usr/bin/plutil -lint "$kext/Contents/Info.plist" >/dev/null
+            exe=$(/usr/libexec/PlistBuddy -c 'Print CFBundleExecutable' "$kext/Contents/Info.plist")
+            test -s "$kext/Contents/MacOS/$exe" || { echo "Missing kext executable: $kext/$exe" >&2; exit 1; }
+            /usr/bin/file -b "$kext/Contents/MacOS/$exe" | grep -q 'x86_64' || {
+              echo "Wrong binary architecture in $kext" >&2; exit 1;
+            }
+          done
+          python3 - "$HERE/build-manifest.json" <<'PY'
+          import json,sys
+          m=json.load(open(sys.argv[1]))
+          assert '8086:7D55' in m['supported_devices']
+          assert m['component_versions']['NMXGPU']=='1.0.15'
+          assert m['component_versions']['Metal']=='0.3.19'
+          assert m['component_versions']['NMXAccel']=='0.2.9'
+          print('Built for:', ', '.join(m['supported_devices']))
+          print('Commit:',m['source_commit'])
+          PY
+          if command -v codesign >/dev/null 2>&1; then
+            for kext in payload/Library/Extensions/*.kext payload/EFI/OC/Kexts/*.kext; do
+              codesign --verify "$kext" || exit 1
+            done
+          fi
+          echo 'PASS: files, manifests, Mach-O binaries and checksums verify.'
+          echo 'NOTE: This is not a GPU/WindowServer runtime test.'
+          XELPG_EMBEDDED_2_END
+          chmod +x ci-package-tools/scripts/check.sh
+          cat > ci-package-tools/scripts/install.sh <<'XELPG_EMBEDDED_3_END'
+          #!/bin/bash
+          # Explicit, reversible kext + runtime *staging*, NOT automated driver activation.
+          # A functional GPU requires correct OpenCore config and upstream desktop arming.
+          set -euo pipefail
+          HERE="$(cd "$(dirname "$0")" && pwd)"
+          usage(){
+           cat <<'HELP'
+          Usage: ./install.sh --check | --stage
+            --check  Verify bundled files and system architecture; makes no changes.
+            --stage  Back up existing /Library/Extensions kexts, stage new kexts and
+                     userspace payload, and rebuild the kernel collection.
+                     DOES NOT modify EFI, NVRAM, SIP, WindowServer or reboot.
+                     Requires XELPG_ACCEPT_EXPERIMENTAL=YES and sudo.
+          HELP
+          }
+          mode="${1:---check}"
+          case "$mode" in --check|--stage) ;; *) usage; exit 2;; esac
+          "$HERE/check.sh"
+          if [[ "$(uname -s)" != Darwin || "$(uname -m)" != x86_64 ]]; then
+           echo 'macOS on x86_64 required.' >&2; exit 1
+          fi
+          os=$(sw_vers -productVersion)
+          if [[ "$os" != 15.* ]]; then echo "Sequoia macOS 15.x required; found $os" >&2; exit 1; fi
+          printf '\nCurrent graphics devices (inspect for 8086:7D55):\n'
+          system_profiler SPDisplaysDataType 2>/dev/null | head -65 || true
+          if [[ "$mode" == --check ]]; then
+            echo 'Preflight only. For installation guidance read README.md.'
+            exit 0
+          fi
+          if [[ "${XELPG_ACCEPT_EXPERIMENTAL:-}" != YES ]]; then
+            echo 'Refusing stage: set XELPG_ACCEPT_EXPERIMENTAL=YES after reviewing README.md' >&2
+            exit 2
+          fi
+          if [[ $EUID -ne 0 ]]; then
+            echo "Run: sudo env XELPG_ACCEPT_EXPERIMENTAL=YES '$HERE/install.sh' --stage" >&2
+            exit 2
+          fi
+          if [[ -t 0 ]]; then
+            read -r -p 'Confirm target GPU PCI device ID by typing 7D55: ' typed
+            [[ "$typed" == 7D55 ]] || { echo 'PCI ID confirmation rejected' >&2; exit 2; }
+          elif [[ "${XELPG_TARGET_PCI_ID:-}" != 7D55 ]]; then
+            echo 'Noninteractive stage requires XELPG_TARGET_PCI_ID=7D55 confirmation.' >&2
+            exit 2
+          fi
+          state='/Library/Application Support/XeLPG-7D55'
+          backup="$state/backups/$(date +%Y%m%d-%H%M%S)"
+          mkdir -p "$backup" "$state"
+          log="$backup/restore-list.txt"
+          : > "$log"
+          for name in NMXGPU NMXAccel LatitudeMTLFB; do
+            dest="/Library/Extensions/$name.kext"
+            src="$HERE/payload/Library/Extensions/$name.kext"
+            if [[ -e "$dest" ]]; then
+              cp -Rp "$dest" "$backup/$name.kext"
+              printf '%s\told\n' "$name" >> "$log"
+            else
+              printf '%s\tnew\n' "$name" >> "$log"
+            fi
+          done
+          if [[ -d "$state/runtime" ]]; then
+            ditto "$state/runtime" "$backup/runtime"
+          else
+            touch "$backup/runtime-was-missing"
+          fi
+          # Preparation finished before modifying original installation.
+          for name in NMXGPU NMXAccel LatitudeMTLFB; do
+            dest="/Library/Extensions/$name.kext"
+            rm -rf "$dest"
+            ditto "$HERE/payload/Library/Extensions/$name.kext" "$dest"
+            chown -R root:wheel "$dest"
+            chmod -R go-w "$dest"
+          done
+          mkdir -p "$state/runtime"
+          ditto "$HERE/payload/Runtime" "$state/runtime"
+          printf '%s\n' "$backup" > "$state/last-backup.txt"
+          echo "Previous kexts saved under: $backup"
+          echo 'Rebuilding Auxiliary Kernel Collection (if validation fails, review logs and restore)...'
+          if ! kmutil install --volume-root / --update-all; then
+            echo 'Kernel collection rebuild failed. Restore using rollback.sh.' >&2
+            exit 1
+          fi
+          echo 'Staging complete. NO reboot performed.'
+          echo 'You must install/enable LatitudePanelClaim.kext in OpenCore config.plist and'
+          echo 'follow the upstream one-shot desktop activation procedure before expecting Metal acceleration.'
+          XELPG_EMBEDDED_3_END
+          chmod +x ci-package-tools/scripts/install.sh
+          cat > ci-package-tools/scripts/rollback.sh <<'XELPG_EMBEDDED_4_END'
+          #!/bin/bash
+          # Restore kexts staged by this package. No automatic reboot or EFI change.
+          set -euo pipefail
+          HERE="$(cd "$(dirname "$0")" && pwd)"
+          state='/Library/Application Support/XeLPG-7D55'
+          if [[ ${1:-} != --restore ]]; then
+           echo 'Usage: sudo ./rollback.sh --restore'
+           exit 2
+          fi
+          if [[ $EUID -ne 0 ]]; then
+           echo 'Run via sudo to restore kexts' >&2; exit 2
+          fi
+          marker="$state/last-backup.txt"
+          [[ -f "$marker" ]] || { echo 'No staged kext backup recorded.' >&2; exit 1; }
+          backup="$(cat "$marker")"
+          [[ "$backup" == "$state"/backups/* && -d "$backup" ]] || {
+           echo "Unexpected backup path: $backup" >&2; exit 1;
+          }
+          while IFS=$'\t' read -r name action; do
+           case "$name" in NMXGPU|NMXAccel|LatitudeMTLFB) ;; *) echo 'Invalid backup manifest' >&2; exit 1;; esac
+           dest="/Library/Extensions/$name.kext"
+           case "$action" in
+             old) [[ -d "$backup/$name.kext" ]] || { echo "Missing backup for $name" >&2; exit 1; }; rm -rf "$dest"; ditto "$backup/$name.kext" "$dest";;
+             new) rm -rf "$dest";;
+             *) echo 'Invalid backup manifest action' >&2; exit 1;;
+           esac
+          done < "$backup/restore-list.txt"
+          if [[ -d "$backup/runtime" ]]; then
+            rm -rf "$state/runtime"
+            ditto "$backup/runtime" "$state/runtime"
+          elif [[ -e "$backup/runtime-was-missing" ]]; then
+            rm -rf "$state/runtime"
+          fi
+          kmutil install --volume-root / --update-all
+          rm -f "$marker"
+          echo 'Previous kexts restored; EFI/OpenCore and WindowServer changes must be reversed separately.'
+          echo 'Reboot only after reviewing boot configuration. No reboot was performed.'
+          XELPG_EMBEDDED_4_END
+          chmod +x ci-package-tools/scripts/rollback.sh
+          cat > ci-package-tools/scripts/test.sh <<'XELPG_EMBEDDED_5_END'
+          #!/bin/bash
+          set -euo pipefail
+          HERE="$(cd "$(dirname "$0")" && pwd)"
+          case "${1:---static}" in
+            --static)
+              exec "$HERE/check.sh"
+              ;;
+            --live)
+              "$HERE/check.sh"
+              if [[ $(uname -s) != Darwin ]]; then echo 'macOS required' >&2; exit 1; fi
+              echo '--- Loaded Xe-LPG kernel extensions ---'
+              kmutil showloaded | grep -Ei 'NMX|Latitude' || true
+              echo '--- Graphics inventory ---'
+              system_profiler SPDisplaysDataType || true
+              echo '--- PCI / IOKit attachment evidence ---'
+              ioreg -p IOService -l | grep -Ei '7d55|7d45|NMXGPU|NMXAccel|LatitudeMTLFB|LatitudePanelClaim' | head -100 || true
+              echo '--- Recent kernel/user-client log ---'
+              log show --last 5m --style compact --predicate 'eventMessage CONTAINS[c] "NMXGPU" OR eventMessage CONTAINS[c] "NMXAccel"' 2>/dev/null | tail -100 || true
+              echo '--- Optional Vulkan / Metal application tests ---'
+              tools="$HERE/upstream/latitude-runtime/tools"
+              if [[ -x "$tools/latitude-vulkan-test" && -s "$tools/check.spv" ]]; then
+                echo 'Running Vulkan test (requires operational GPU and full installed runtime)'
+                "$tools/latitude-vulkan-test" "$tools/check.spv"
+              else
+                echo 'SKIP Vulkan test: upstream test executable or check.spv absent'
+              fi
+              if [[ -x "$tools/latitude-metal-test" ]]; then
+                echo 'Running Metal test (requires installed GPU runtime)'
+                "$tools/latitude-metal-test"
+              else
+                echo 'SKIP Metal test: upstream test executable absent'
+              fi
+              echo 'Live diagnostics finished; screenshot/compositor/readback gates are NOT exercised automatically.'
+              ;;
+            *) echo 'Usage: ./test.sh --static | --live' >&2;exit 2;;
+          esac
+          XELPG_EMBEDDED_5_END
+          chmod +x ci-package-tools/scripts/test.sh
+          cat > ci-package-tools/scripts/README.md <<'XELPG_EMBEDDED_6_END'
+          # Xe-LPG 7D55 — experimental macOS Sequoia installation package
+          
+          This package is built by your fork's GitHub Actions run, not a vetted Dell release.
+          The supported PCI identities in the kernel and panel-claim plists must both include
+          `8086:7D55` and `8086:7D45`. The `build-manifest.json` records component versions,
+          source commit, and selected binary paths; `SHA256SUMS.txt` covers all package files.
+          
+          ## Before installing
+          
+          * macOS **15.x Sequoia x86_64** only.
+          * **Back up the entire disk and EFI**, keep a bootable working OpenCore USB and a
+            nonaccelerated boot option. Experimental graphics can cause a boot loop or panic.
+          * Confirm your laptop's PCI ID is really 8086:7D55 and hardware/firmware/ACPI
+            assumptions are correct. Dell-specific panel identifiers are **not** universal.
+          * Understand upstream's security prerequisites, SIP, AMFI, and Auxiliary Kernel
+            Collection setup. This package does not silently disable security protections.
+          * Check current upstream instructions before changing WindowServer. Full hardware
+            validation is only possible on the target laptop, not GitHub's CI runner.
+          
+          ## Layout
+          
+          * `payload/Library/Extensions` — NMXGPU.kext, NMXAccel.kext, LatitudeMTLFB.kext.
+          * `payload/EFI/OC/Kexts/LatitudePanelClaim.kext` — candidate for **manual** OpenCore
+            integration. Add it to `config.plist` and check load order only after backing up EFI.
+          * `payload/Metal` — compiled NVMTLDriver 0.3.19 and possibly its upstream bundle
+            template. The upstream one-shot runtime installer controls actual Metal activation.
+          * `payload/Runtime/lib` — freshly built ANV, libdrm, and AIR-to-SPIR-V translator; library paths require the
+            upstream runtime staging/launcher to resolve correctly.
+          * `payload/Firmware/i915` — firmware sources to stage as upstream requires.
+          * `upstream/latitude-runtime`, `upstream/latitude-desktop`, `upstream/desktop-sources`
+            — accompanying upstream scripts and tests. They may refer to the original Dell's
+            USB paths and **must not be run blindly** on another laptop.
+          
+          ## Commands on your Hackintosh
+          
+          ```bash
+          cd XeLPG-7D55
+          ./install.sh --check       # offline static manifest and OS verification
+          ./test.sh --static         # checksums and Mach-O checks, no system changes
+          ```
+          
+          First edit **OpenCore** manually: use a backed-up EFI, stage
+          `LatitudePanelClaim.kext` under `EFI/OC/Kexts`, add matching Kernel/Add entry,
+          keep the previously working boot entry, and verify macOS still boots *without*
+          activating GPU acceleration. Do not replace unrelated Wi-Fi/touchpad/ACPI kexts.
+          
+          If you elect to stage kernel extensions (not a complete GPU activation):
+          
+          ```bash
+          sudo env XELPG_ACCEPT_EXPERIMENTAL=YES ./install.sh --stage
+          # then type 7D55 to confirm the experimental target PCI ID
+          ```
+          
+          That backs up existing kexts, stages the three kexts in `/Library/Extensions`,
+          places userspace libraries under `/Library/Application Support/XeLPG-7D55/runtime`,
+          then runs `kmutil install --volume-root / --update-all`. It **does not** install
+          WindowServer hooks, modify OpenCore, disable SIP/AMFI, set NVRAM, or reboot.
+          It intentionally does **not** advertise full graphics enablement at this point.
+          For the final system-level plugin activation follow the source project's manual,
+          one-shot `install-windowserver.sh` sequence after adapting Dell/USB paths.
+          
+          Rollback staged kexts (from working Sequoia or Recovery with the target volume
+          mounted at `/`; adapt the paths appropriately):
+          
+          ```bash
+          sudo ./rollback.sh --restore
+          ```
+          
+          The rollback covers only the kexts touched by this packager. Any manual EFI,
+          security, or WindowServer changes require their own manual rollback; the upstream
+          `latitude-runtime/rollback-runtime.sh` addresses its own runtime changes.
+          
+          Hardware diagnostics and optional Vulkan/Metal tests after a successful boot:
+          
+          ```bash
+          ./test.sh --live
+          ```
+          
+          **Limitations:** A CI `PASS` verifies static packaging, build versions, Mach-O
+          architecture, code signatures and hashes. It does not prove your 7D55 laptop can
+          load NMXGPU, initialise firmware, use Metal/Vulkan, or safely accelerate WindowServer.
+          
+          ## CI provenance and important limits
+          
+          The NMXGPU executable and staged Mesa/DRM libraries were built by this CI run.
+          NMXAccel, framebuffer and some plugin runtime templates may come from the
+          checked-out repository; their versions and Mach-O format are validated, but
+          they are NOT necessarily rebuilt by this workflow. See build-manifest.json
+          for exact paths. No CI runner can validate 7D55 hardware attachment or
+          Dell-specific framebuffer/ACPI assumptions. Never treat static PASS as a
+          reason to enable automatic boot activation.
+          XELPG_EMBEDDED_6_END
+          python3.14 -m py_compile ci-package-tools/packager.py ci-package-tools/test_packager.py
+          for script in ci-package-tools/scripts/*.sh; do bash -n "$script"; done
+          echo 'All install packaging tools were generated from THIS workflow; no separate .github/xelpg files required.'
 
-      - name: Assemble complete 7D55 installation package
+      - name: Test installer ZIP creation using synthetic fixtures
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p dist ci-logs
-          python3.14 .github/xelpg/packager.py \
+          python3.14 ci-package-tools/test_packager.py 2>&1 | tee ci-logs/install-packager-test.log
+
+      - name: Assemble full installation ZIP (strict version and layout gate)
+        id: install_package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ci-install
+          python3.14 ci-package-tools/packager.py \
             --repo "$GITHUB_WORKSPACE" \
-            --templates "$GITHUB_WORKSPACE/.github/xelpg/scripts" \
+            --templates "$GITHUB_WORKSPACE/ci-package-tools/scripts" \
             --sha "$GITHUB_SHA" \
-            --out "$GITHUB_WORKSPACE/dist/XeLPG-7D55-macOS15-${GITHUB_RUN_NUMBER}.zip" \
-            2>&1 | tee ci-logs/packaging.log
+            --out "$GITHUB_WORKSPACE/ci-install/XeLPG-7D55-Sequoia-x86_64.zip" \
+            2>&1 | tee ci-logs/installation-packaging.log
+          test -s ci-install/XeLPG-7D55-Sequoia-x86_64.zip
+          # Exercise the actual install ZIP, not just source-script syntax.
+          mkdir -p ci-install/extract-test
+          ditto -x -k ci-install/XeLPG-7D55-Sequoia-x86_64.zip ci-install/extract-test
+          bash ci-install/extract-test/XeLPG-7D55/check.sh 2>&1 | tee ci-logs/installation-static-test.log
+          bash ci-install/extract-test/XeLPG-7D55/test.sh --static             2>&1 | tee ci-logs/installation-smoke-test.log
+          rm -rf ci-install/extract-test
+          shasum -a 256 ci-install/XeLPG-7D55-Sequoia-x86_64.zip | tee ci-install/ZIP-SHA256.txt
 
-      - name: Smoke-test packaged ZIP on macOS
-        shell: bash
-        run: |
-          set -euo pipefail
-          archive="$(find dist -maxdepth 1 -type f -name 'XeLPG-7D55-macOS15-*.zip' -print -quit)"
-          test -s "$archive"
-          scratch="$(mktemp -d)"
-          trap 'rm -rf "$scratch"' EXIT
-          unzip -q "$archive" -d "$scratch"
-          "$scratch/XeLPG-7D55/check.sh" 2>&1 | tee ci-logs/package-smoke-test.log
-          echo "Verified install ZIP: $archive"
-
-      - name: Upload install-ready ZIP
+      - name: Upload ready-to-stage installation ZIP
+        if: ${{ success() && steps.install_package.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
           name: XeLPG-7D55-Install-${{ github.run_number }}
-          path: dist/XeLPG-7D55-macOS15-*.zip
+          path: |
+            ci-install/XeLPG-7D55-Sequoia-x86_64.zip
+            ci-install/ZIP-SHA256.txt
           if-no-files-found: error
           retention-days: 14
 
@@ -658,7 +1363,7 @@ jobs:
           set -euo pipefail
           mkdir -p ci-artifacts
           for dir in \
-            ci-logs desktop-build \
+            ci-logs desktop-build ci-package-tools ci-install \
             latitude-desktop/Library/Extensions latitude-desktop/EFI-Kexts \
             NullMoth/gpu-port/xkpi/logs NullMoth/gpu-port/xkpi/logs-i915 \
             build-tree/mesa-build/meson-logs build-tree/drm-build/meson-logs; do
